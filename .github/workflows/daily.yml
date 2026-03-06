@@ -36,7 +36,10 @@ jobs:
         run: |
           git config --local user.email "monitor-bot@github.com"
           git config --local user.name "Monitor Bot"
-          git pull --rebase origin main
           git add data/properties.json
-          git diff --staged --quiet || git commit -m "🏠 Update: $(date +'%Y-%m-%d %H:%M') ART"
+          git stash
+          git pull --rebase origin main
+          git stash pop
+          git diff --staged --quiet || git add data/properties.json
+          git diff --cached --quiet || git commit -m "🏠 Update: $(date +'%Y-%m-%d %H:%M') ART"
           git push
