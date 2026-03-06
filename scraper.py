@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
 Monitor Inmobiliario — GBA Norte
-Scraper para: Zonaprop, Argenprop, MercadoLibre, Properati, Inmuebles24
+Fuentes: MercadoLibre API (confiable) + Argenprop (HTML corregido)
 Zonas: Vicente López, Florida, La Lucila, San Isidro
 Precio: USD 250.000 – 350.000
-Tipos: Casas, PH, Terrenos, Galpones/Depósitos
 """
 
 import json
@@ -12,7 +11,7 @@ import hashlib
 import time
 import random
 import logging
-import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,537 +22,264 @@ from bs4 import BeautifulSoup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-
-ZONES = ["vicente-lopez", "florida", "la-lucila", "san-isidro"]
-ZONES_DISPLAY = ["Vicente López", "Florida", "La Lucila", "San Isidro"]
 PRICE_MIN = 250000
 PRICE_MAX = 350000
-PROPERTY_TYPES_ZP = ["casa", "ph", "terreno", "galpon", "deposito"]
-
 DATA_FILE = Path(__file__).parent.parent / "data" / "properties.json"
-
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "es-AR,es;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-def make_id(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()[:12]
-
-def sleep_random(a=2, b=5):
-    time.sleep(random.uniform(a, b))
-
-def get_page(url: str, retries=3) -> Optional[BeautifulSoup]:
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-            r.raise_for_status()
-            return BeautifulSoup(r.text, "html.parser")
-        except Exception as e:
-            log.warning(f"Attempt {attempt+1} failed for {url}: {e}")
-            time.sleep(5 * (attempt + 1))
-    return None
-
-def parse_price(text: str) -> Optional[int]:
-    """Extract USD price from string."""
-    import re
-    text = text.replace(".", "").replace(",", "").upper()
-    m = re.search(r"USD\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"U\$S\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"\$\s*(\d{5,})", text)
-    if m:
-        val = int(m.group(1))
-        if 250000 <= val <= 350000:
-            return val
-    return None
-
-def parse_surface(text: str) -> Optional[int]:
-    import re
+def make_id(url): return hashlib.md5(url.encode()).hexdigest()[:12]
+def sleep_random(a=2, b=5): time.sleep(random.uniform(a, b))
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def parse_surface(text):
+    if not text: return None
     m = re.search(r"(\d+)\s*m", text.lower())
     return int(m.group(1)) if m else None
 
-# ─── ZONAPROP ────────────────────────────────────────────────────────────────
+# ── MERCADOLIBRE API ──────────────────────────────────────────────────────────
 
-def scrape_zonaprop() -> list:
+ML_CATEGORIES = {
+    "Casa": "MLA1459", "PH": "MLA1460",
+    "Terreno": "MLA1461", "Galpón": "MLA1473", "Depósito": "MLA1472",
+}
+
+def scrape_mercadolibre_api():
     results = []
-    type_slugs = {
-        "Casa": "casas",
-        "PH": "ph",
-        "Terreno": "terrenos",
-        "Galpón": "galpones",
-        "Depósito": "depositos",
-    }
-    zone_slugs = {
-        "Vicente López": "vicente-lopez-partido",
-        "Florida": "florida-partido-vicente-lopez",
-        "La Lucila": "la-lucila-partido-vicente-lopez",
-        "San Isidro": "san-isidro-partido",
-    }
+    base_url = "https://api.mercadolibre.com/sites/MLA/search"
+    zones_query = ["Vicente Lopez", "San Isidro", "Florida Buenos Aires", "La Lucila"]
+    zones_display = ["Vicente López", "San Isidro", "Florida", "La Lucila"]
 
-    for ptype_name, ptype_slug in type_slugs.items():
-        for zone_name, zone_slug in zone_slugs.items():
-            url = (
-                f"https://www.zonaprop.com.ar/{ptype_slug}-venta-{zone_slug}"
-                f"-{PRICE_MIN}-{PRICE_MAX}-dolar.html"
-            )
-            log.info(f"[Zonaprop] {ptype_name} en {zone_name}")
-            soup = get_page(url)
-            if not soup:
-                continue
-
-            for card in soup.select("[data-id]")[:30]:
+    for ptype_name, cat_id in ML_CATEGORIES.items():
+        for zone_q, zone_name in zip(zones_query, zones_display):
+            offset = 0
+            page_results = 0
+            while True:
+                params = {
+                    "category": cat_id,
+                    "price": f"{PRICE_MIN}-{PRICE_MAX}",
+                    "currency_id": "USD",
+                    "q": zone_q,
+                    "limit": 50,
+                    "offset": offset,
+                }
                 try:
-                    title_el = card.select_one("[class*='title']")
-                    price_el = card.select_one("[class*='price']")
-                    addr_el = card.select_one("[class*='address'], [class*='location']")
-                    surface_el = card.select_one("[class*='surface'], [class*='area']")
-                    link_el = card.select_one("a[href]")
-                    rooms_el = card.select_one("[class*='room'], [class*='ambiente']")
-
-                    if not price_el:
-                        continue
-
-                    price = parse_price(price_el.get_text())
-                    if not price or not (PRICE_MIN <= price <= PRICE_MAX):
-                        continue
-
-                    href = link_el["href"] if link_el else ""
-                    full_url = f"https://www.zonaprop.com.ar{href}" if href.startswith("/") else href
-
-                    results.append({
-                        "id": make_id(full_url),
-                        "source": "Zonaprop",
-                        "type": ptype_name,
-                        "zone": zone_name,
-                        "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_name}",
-                        "address": addr_el.get_text(strip=True) if addr_el else zone_name,
-                        "price_usd": price,
-                        "surface_m2": parse_surface(surface_el.get_text()) if surface_el else None,
-                        "rooms": rooms_el.get_text(strip=True) if rooms_el else None,
-                        "url": full_url,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "last_seen": datetime.now(timezone.utc).isoformat(),
-                    })
+                    r = requests.get(base_url, params=params, timeout=20)
+                    r.raise_for_status()
+                    data = r.json()
                 except Exception as e:
-                    log.debug(f"Error parsing Zonaprop card: {e}")
+                    log.warning(f"[ML API] {ptype_name}/{zone_name} offset {offset}: {e}")
+                    break
 
-            sleep_random(2, 4)
+                items = data.get("results", [])
+                if not items:
+                    break
 
-    log.info(f"[Zonaprop] {len(results)} propiedades encontradas")
+                for item in items:
+                    try:
+                        price = item.get("price")
+                        if not price or not (PRICE_MIN <= price <= PRICE_MAX):
+                            continue
+                        attrs = {a["id"]: a.get("value_name") for a in item.get("attributes", [])}
+                        surface_str = attrs.get("TOTAL_AREA") or attrs.get("COVERED_AREA")
+                        surface_m2 = parse_surface(surface_str) if surface_str else None
+                        rooms = attrs.get("ROOMS")
+                        bedrooms = attrs.get("BEDROOMS")
+                        rooms_str = f"{rooms} amb." if rooms else (f"{bedrooms} dorm." if bedrooms else None)
+                        url = item.get("permalink", "")
+                        address = item.get("location", {}).get("address_line") or zone_name
+                        results.append({
+                            "id": make_id(url),
+                            "source": "MercadoLibre",
+                            "type": ptype_name,
+                            "zone": zone_name,
+                            "title": item.get("title", f"{ptype_name} en {zone_name}"),
+                            "address": address,
+                            "price_usd": int(price),
+                            "surface_m2": surface_m2,
+                            "rooms": rooms_str,
+                            "url": url,
+                            "first_seen": now_iso(),
+                            "last_seen": now_iso(),
+                        })
+                        page_results += 1
+                    except Exception as e:
+                        log.debug(f"Error item ML: {e}")
+
+                total = data.get("paging", {}).get("total", 0)
+                offset += 50
+                if offset >= min(total, 150):
+                    break
+                sleep_random(0.5, 1.5)
+
+            log.info(f"[ML API] {ptype_name} en {zone_name}: {page_results} encontradas")
+            sleep_random(1, 2)
+
+    log.info(f"[MercadoLibre] {len(results)} propiedades totales")
     return results
 
-# ─── ARGENPROP ───────────────────────────────────────────────────────────────
+# ── ARGENPROP ─────────────────────────────────────────────────────────────────
 
-def scrape_argenprop() -> list:
+ARGENPROP_TYPES = {"Casa": "casas", "PH": "ph", "Terreno": "terrenos", "Galpón": "galpones"}
+ARGENPROP_ZONES = {
+    "Vicente López": ["localidad-vicente-lopez", "partido-vicente-lopez"],
+    "San Isidro":    ["localidad-san-isidro", "partido-san-isidro"],
+    "Florida":       ["localidad-florida"],
+    "La Lucila":     ["localidad-la-lucila"],
+}
+
+def scrape_argenprop():
     results = []
-    type_slugs = {
-        "Casa": "casa",
-        "PH": "ph",
-        "Terreno": "terreno",
-        "Galpón": "galpon",
-        "Depósito": "deposito",
-    }
-    zone_ids = {
-        "Vicente López": "partido-vicente-lopez",
-        "San Isidro": "partido-san-isidro",
-    }
-
-    for ptype_name, ptype_slug in type_slugs.items():
-        for zone_name, zone_slug in zone_ids.items():
-            url = (
-                f"https://www.argenprop.com/{ptype_slug}/venta/{zone_slug}"
-                f"?precio-desde={PRICE_MIN}&precio-hasta={PRICE_MAX}&moneda=dolares"
-            )
-            log.info(f"[Argenprop] {ptype_name} en {zone_name}")
-            soup = get_page(url)
-            if not soup:
-                continue
-
-            for card in soup.select(".card--property, .listing__item")[:30]:
+    for ptype_name, ptype_slug in ARGENPROP_TYPES.items():
+        for zone_name, zone_slugs in ARGENPROP_ZONES.items():
+            found = False
+            for zone_slug in zone_slugs:
+                url = (
+                    f"https://www.argenprop.com/{ptype_slug}/venta/{zone_slug}"
+                    f"?precio-desde={PRICE_MIN}&precio-hasta={PRICE_MAX}&moneda=dolares"
+                )
+                log.info(f"[Argenprop] {ptype_name} en {zone_name}")
                 try:
-                    title_el = card.select_one(".card__title, .listing__title")
-                    price_el = card.select_one(".card__price, .listing__price")
-                    addr_el = card.select_one(".card__address, .listing__address")
-                    surface_el = card.select_one(".card__main-features, .listing__features")
-                    link_el = card.select_one("a[href]")
-
-                    if not price_el:
+                    r = requests.get(url, headers=HEADERS, timeout=20)
+                    if r.status_code in (404, 403):
                         continue
-
-                    price = parse_price(price_el.get_text())
-                    if not price or not (PRICE_MIN <= price <= PRICE_MAX):
-                        continue
-
-                    href = link_el["href"] if link_el else ""
-                    full_url = f"https://www.argenprop.com{href}" if href.startswith("/") else href
-
-                    results.append({
-                        "id": make_id(full_url),
-                        "source": "Argenprop",
-                        "type": ptype_name,
-                        "zone": zone_name,
-                        "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_name}",
-                        "address": addr_el.get_text(strip=True) if addr_el else zone_name,
-                        "price_usd": price,
-                        "surface_m2": parse_surface(surface_el.get_text()) if surface_el else None,
-                        "rooms": None,
-                        "url": full_url,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "last_seen": datetime.now(timezone.utc).isoformat(),
-                    })
+                    r.raise_for_status()
                 except Exception as e:
-                    log.debug(f"Error parsing Argenprop card: {e}")
+                    log.warning(f"[Argenprop] {e}")
+                    continue
 
-            sleep_random(2, 4)
+                soup = BeautifulSoup(r.text, "html.parser")
+                cards = soup.select(".card--property") or soup.select(".card") or soup.select("article[class*='card']")
+
+                for card in cards[:30]:
+                    try:
+                        price_el = card.select_one("[class*='price']")
+                        if not price_el: continue
+                        price_text = price_el.get_text(strip=True)
+                        price_match = re.search(r"(?:USD|U\$S|u\$s)\s*([\d.,]+)", price_text, re.IGNORECASE)
+                        if not price_match: continue
+                        price = int(re.sub(r"[.,]", "", price_match.group(1)))
+                        if price < 1000: price *= 1000
+                        if not (PRICE_MIN <= price <= PRICE_MAX): continue
+
+                        link_el = card.select_one("a[href]")
+                        href = link_el["href"] if link_el else ""
+                        full_url = f"https://www.argenprop.com{href}" if href.startswith("/") else href
+                        if not full_url: continue
+
+                        title_el = card.select_one("[class*='title'], h2, h3")
+                        addr_el = card.select_one("[class*='address'], [class*='location']")
+                        surface_el = card.select_one("[class*='surface'], [class*='area']")
+
+                        results.append({
+                            "id": make_id(full_url),
+                            "source": "Argenprop",
+                            "type": ptype_name,
+                            "zone": zone_name,
+                            "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_name}",
+                            "address": addr_el.get_text(strip=True) if addr_el else zone_name,
+                            "price_usd": price,
+                            "surface_m2": parse_surface(surface_el.get_text()) if surface_el else None,
+                            "rooms": None,
+                            "url": full_url,
+                            "first_seen": now_iso(),
+                            "last_seen": now_iso(),
+                        })
+                        found = True
+                    except Exception as e:
+                        log.debug(f"Error Argenprop card: {e}")
+
+                if found:
+                    break
+                sleep_random(2, 4)
+
+            sleep_random(3, 5)
 
     log.info(f"[Argenprop] {len(results)} propiedades encontradas")
     return results
 
-# ─── MERCADOLIBRE ────────────────────────────────────────────────────────────
+# ── DEDUP & DIFF ──────────────────────────────────────────────────────────────
 
-def scrape_mercadolibre() -> list:
-    results = []
-    categories = {
-        "Casa": "MLA1459",
-        "PH": "MLA1460",
-        "Terreno": "MLA1461",
-        "Galpón": "MLA9998",
-    }
-    zones_ml = {
-        "Vicente López": "vicente+lopez",
-        "San Isidro": "san+isidro",
-        "Florida": "florida+vicente+lopez",
-        "La Lucila": "la+lucila",
-    }
-
-    for ptype_name, cat_id in categories.items():
-        for zone_name, zone_q in zones_ml.items():
-            url = (
-                f"https://inmuebles.mercadolibre.com.ar/{cat_id}/venta/"
-                f"_PriceRange_{PRICE_MIN}usd-{PRICE_MAX}usd"
-                f"_q_{zone_q}"
-            )
-            log.info(f"[MercadoLibre] {ptype_name} en {zone_name}")
-            soup = get_page(url)
-            if not soup:
-                continue
-
-            for card in soup.select(".ui-search-result__wrapper, .results-item")[:20]:
-                try:
-                    title_el = card.select_one(".ui-search-item__title, h2")
-                    price_el = card.select_one(".price-tag-fraction, .ui-search-price__second-line")
-                    addr_el = card.select_one(".ui-search-item__location, .ui-search-item__group--location")
-                    link_el = card.select_one("a.ui-search-link, a[href*='inmuebles']")
-                    attr_els = card.select(".ui-search-item__details li")
-
-                    if not price_el:
-                        continue
-
-                    price_text = price_el.get_text(strip=True)
-                    # ML shows price without USD symbol sometimes, add context
-                    price = parse_price(f"USD {price_text}")
-                    if not price:
-                        price = parse_price(price_text)
-                    if not price or not (PRICE_MIN <= price <= PRICE_MAX):
-                        continue
-
-                    href = link_el["href"] if link_el else ""
-                    surface = None
-                    rooms = None
-                    for attr in attr_els:
-                        txt = attr.get_text(strip=True).lower()
-                        if "m²" in txt or "m2" in txt:
-                            surface = parse_surface(txt)
-                        if "amb" in txt or "dorm" in txt:
-                            rooms = txt
-
-                    results.append({
-                        "id": make_id(href),
-                        "source": "MercadoLibre",
-                        "type": ptype_name,
-                        "zone": zone_name,
-                        "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_name}",
-                        "address": addr_el.get_text(strip=True) if addr_el else zone_name,
-                        "price_usd": price,
-                        "surface_m2": surface,
-                        "rooms": rooms,
-                        "url": href,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "last_seen": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as e:
-                    log.debug(f"Error parsing MercadoLibre card: {e}")
-
-            sleep_random(3, 6)
-
-    log.info(f"[MercadoLibre] {len(results)} propiedades encontradas")
-    return results
-
-# ─── PROPERATI ───────────────────────────────────────────────────────────────
-
-def scrape_properati() -> list:
-    results = []
-    type_slugs = {
-        "Casa": "casas",
-        "PH": "ph",
-        "Terreno": "terrenos",
-    }
-    zones_p = ["vicente-lopez", "san-isidro", "la-lucila", "florida"]
-    zone_display = {
-        "vicente-lopez": "Vicente López",
-        "san-isidro": "San Isidro",
-        "la-lucila": "La Lucila",
-        "florida": "Florida",
-    }
-
-    for ptype_name, ptype_slug in type_slugs.items():
-        for zone_slug in zones_p:
-            url = (
-                f"https://www.properati.com.ar/{zone_slug}/{ptype_slug}/venta/"
-                f"?precio-min={PRICE_MIN}&precio-max={PRICE_MAX}&currency=USD"
-            )
-            log.info(f"[Properati] {ptype_name} en {zone_display[zone_slug]}")
-            soup = get_page(url)
-            if not soup:
-                continue
-
-            for card in soup.select(".listing-card, [class*='ListingCard']")[:20]:
-                try:
-                    title_el = card.select_one("[class*='title'], h2, h3")
-                    price_el = card.select_one("[class*='price'], [class*='Price']")
-                    addr_el = card.select_one("[class*='address'], [class*='location']")
-                    link_el = card.select_one("a[href]")
-                    surface_el = card.select_one("[class*='surface'], [class*='area']")
-
-                    if not price_el:
-                        continue
-
-                    price = parse_price(price_el.get_text())
-                    if not price or not (PRICE_MIN <= price <= PRICE_MAX):
-                        continue
-
-                    href = link_el["href"] if link_el else ""
-                    full_url = f"https://www.properati.com.ar{href}" if href.startswith("/") else href
-
-                    results.append({
-                        "id": make_id(full_url),
-                        "source": "Properati",
-                        "type": ptype_name,
-                        "zone": zone_display[zone_slug],
-                        "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_display[zone_slug]}",
-                        "address": addr_el.get_text(strip=True) if addr_el else zone_display[zone_slug],
-                        "price_usd": price,
-                        "surface_m2": parse_surface(surface_el.get_text()) if surface_el else None,
-                        "rooms": None,
-                        "url": full_url,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "last_seen": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as e:
-                    log.debug(f"Error parsing Properati card: {e}")
-
-            sleep_random(2, 5)
-
-    log.info(f"[Properati] {len(results)} propiedades encontradas")
-    return results
-
-# ─── INMUEBLES24 ─────────────────────────────────────────────────────────────
-
-def scrape_inmuebles24() -> list:
-    results = []
-    zones_i24 = {
-        "Vicente López": "vicente-lopez",
-        "San Isidro": "san-isidro",
-        "La Lucila": "la-lucila",
-        "Florida": "florida",
-    }
-    type_slugs = {
-        "Casa": "casas",
-        "PH": "ph",
-        "Terreno": "terrenos",
-    }
-
-    for ptype_name, ptype_slug in type_slugs.items():
-        for zone_name, zone_slug in zones_i24.items():
-            url = (
-                f"https://www.inmuebles24.com/{ptype_slug}-venta-en-{zone_slug}.html"
-                f"?precio-desde={PRICE_MIN}&precio-hasta={PRICE_MAX}&moneda=Dolares"
-            )
-            log.info(f"[Inmuebles24] {ptype_name} en {zone_name}")
-            soup = get_page(url)
-            if not soup:
-                continue
-
-            for card in soup.select("[data-id], .posting-card")[:20]:
-                try:
-                    title_el = card.select_one("[class*='title'], h2, h3")
-                    price_el = card.select_one("[class*='price']")
-                    addr_el = card.select_one("[class*='location'], [class*='address']")
-                    link_el = card.select_one("a[href]")
-                    surface_el = card.select_one("[class*='surface']")
-
-                    if not price_el:
-                        continue
-
-                    price = parse_price(price_el.get_text())
-                    if not price or not (PRICE_MIN <= price <= PRICE_MAX):
-                        continue
-
-                    href = link_el["href"] if link_el else ""
-                    full_url = f"https://www.inmuebles24.com{href}" if href.startswith("/") else href
-
-                    results.append({
-                        "id": make_id(full_url),
-                        "source": "Inmuebles24",
-                        "type": ptype_name,
-                        "zone": zone_name,
-                        "title": title_el.get_text(strip=True) if title_el else f"{ptype_name} en {zone_name}",
-                        "address": addr_el.get_text(strip=True) if addr_el else zone_name,
-                        "price_usd": price,
-                        "surface_m2": parse_surface(surface_el.get_text()) if surface_el else None,
-                        "rooms": None,
-                        "url": full_url,
-                        "first_seen": datetime.now(timezone.utc).isoformat(),
-                        "last_seen": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as e:
-                    log.debug(f"Error parsing Inmuebles24 card: {e}")
-
-            sleep_random(2, 4)
-
-    log.info(f"[Inmuebles24] {len(results)} propiedades encontradas")
-    return results
-
-# ─── DEDUP & DIFF ─────────────────────────────────────────────────────────────
-
-def dedup(props: list) -> list:
+def dedup(props):
     seen = {}
     for p in props:
         if p["id"] not in seen:
             seen[p["id"]] = p
     return list(seen.values())
 
-def diff(old_props: list, new_props: list):
+def diff(old_props, new_props):
     old_map = {p["id"]: p for p in old_props}
     new_map = {p["id"]: p for p in new_props}
-
-    new_today = [p for pid, p in new_map.items() if pid not in old_map]
+    new_today     = [p for pid, p in new_map.items() if pid not in old_map]
     removed_today = [p for pid, p in old_map.items() if pid not in new_map]
-
     price_changes = []
     for pid, new_p in new_map.items():
         if pid in old_map:
-            old_price = old_map[pid].get("price_usd")
-            new_price = new_p.get("price_usd")
-            if old_price and new_price and old_price != new_price:
-                price_changes.append({
-                    **new_p,
-                    "old_price_usd": old_price,
-                    "price_change_pct": round((new_price - old_price) / old_price * 100, 1),
-                })
-
+            op = old_map[pid].get("price_usd")
+            np = new_p.get("price_usd")
+            if op and np and op != np:
+                price_changes.append({**new_p, "old_price_usd": op,
+                    "price_change_pct": round((np - op) / op * 100, 1)})
     return new_today, removed_today, price_changes
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("=== Monitor Inmobiliario GBA Norte — iniciando scraping ===")
+    log.info("=== Monitor Inmobiliario GBA Norte ===")
 
-    # Load previous data
     old_props = []
     if DATA_FILE.exists():
         try:
             with open(DATA_FILE) as f:
                 old_data = json.load(f)
                 old_props = old_data.get("all_properties", [])
-                log.info(f"Loaded {len(old_props)} previous properties")
+                log.info(f"Cargadas {len(old_props)} propiedades previas")
         except Exception as e:
-            log.warning(f"Could not load previous data: {e}")
+            log.warning(f"No se pudo cargar data previa: {e}")
 
-    # Run scrapers
     fresh = []
-    scrapers = [
-        ("Zonaprop", scrape_zonaprop),
-        ("Argenprop", scrape_argenprop),
-        ("MercadoLibre", scrape_mercadolibre),
-        ("Properati", scrape_properati),
-        ("Inmuebles24", scrape_inmuebles24),
-    ]
-
-    for name, fn in scrapers:
+    for name, fn in [("MercadoLibre", scrape_mercadolibre_api), ("Argenprop", scrape_argenprop)]:
         try:
-            results = fn()
-            fresh.extend(results)
-            log.info(f"{name}: {len(results)} encontradas")
+            r = fn()
+            fresh.extend(r)
         except Exception as e:
             log.error(f"{name} failed: {e}")
 
     fresh = dedup(fresh)
-    log.info(f"Total después de dedup: {len(fresh)}")
+    log.info(f"Total dedup: {len(fresh)}")
 
-    # Preserve first_seen from old data
     old_map = {p["id"]: p for p in old_props}
     for p in fresh:
         if p["id"] in old_map:
             p["first_seen"] = old_map[p["id"]]["first_seen"]
 
-    # Compute diff
     new_today, removed_today, price_changes = diff(old_props, fresh)
-    log.info(f"Nuevas: {len(new_today)} | Bajas: {len(removed_today)} | Cambios precio: {len(price_changes)}")
-
-    # Stats
-    prices = [p["price_usd"] for p in fresh if p.get("price_usd")]
+    prices   = [p["price_usd"] for p in fresh if p.get("price_usd")]
     surfaces = [p["surface_m2"] for p in fresh if p.get("surface_m2")]
-    avg_price = int(sum(prices) / len(prices)) if prices else 0
-    price_per_m2_list = [
-        p["price_usd"] / p["surface_m2"]
-        for p in fresh
-        if p.get("price_usd") and p.get("surface_m2") and p["surface_m2"] > 0
-    ]
-    avg_ppm2 = int(sum(price_per_m2_list) / len(price_per_m2_list)) if price_per_m2_list else 0
+    ppm2_list = [p["price_usd"]/p["surface_m2"] for p in fresh if p.get("price_usd") and p.get("surface_m2") and p["surface_m2"]>0]
 
-    # Build output
     output = {
-        "last_updated": datetime.now(timezone.utc).isoformat(),
-        "meta": {
-            "zones": ["Vicente López", "Florida", "La Lucila", "San Isidro"],
-            "price_min_usd": PRICE_MIN,
-            "price_max_usd": PRICE_MAX,
-            "types": ["Casa", "PH", "Terreno", "Galpón", "Depósito"],
-        },
+        "last_updated": now_iso(),
+        "meta": {"zones": ["Vicente López","Florida","La Lucila","San Isidro"],
+                 "price_min_usd": PRICE_MIN, "price_max_usd": PRICE_MAX,
+                 "types": ["Casa","PH","Terreno","Galpón","Depósito"]},
         "stats": {
-            "total": len(fresh),
-            "new_today": len(new_today),
-            "removed_today": len(removed_today),
-            "price_changes": len(price_changes),
-            "avg_price_usd": avg_price,
-            "avg_price_per_m2": avg_ppm2,
-            "avg_surface_m2": int(sum(surfaces) / len(surfaces)) if surfaces else 0,
+            "total": len(fresh), "new_today": len(new_today),
+            "removed_today": len(removed_today), "price_changes": len(price_changes),
+            "avg_price_usd": int(sum(prices)/len(prices)) if prices else 0,
+            "avg_price_per_m2": int(sum(ppm2_list)/len(ppm2_list)) if ppm2_list else 0,
+            "avg_surface_m2": int(sum(surfaces)/len(surfaces)) if surfaces else 0,
         },
-        "new_today": new_today,
-        "removed_today": removed_today,
-        "price_changes": price_changes,
-        "all_properties": fresh,
+        "new_today": new_today, "removed_today": removed_today,
+        "price_changes": price_changes, "all_properties": fresh,
     }
 
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    log.info(f"✅ Datos guardados en {DATA_FILE}")
-    log.info(f"Total: {len(fresh)} | Nuevas: {len(new_today)} | Bajas: {len(removed_today)}")
+    log.info(f"✅ Guardado. Total: {len(fresh)} | Nuevas: {len(new_today)} | Bajas: {len(removed_today)} | Cambios: {len(price_changes)}")
 
 if __name__ == "__main__":
     main()
